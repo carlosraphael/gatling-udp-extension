@@ -21,6 +21,10 @@ import org.jboss.netty.channel.ChannelPipelineFactory
 import org.jboss.netty.channel.ChannelPipeline
 import org.jboss.netty.channel.Channels
 import java.net.InetSocketAddress
+import org.jboss.netty.channel.FixedReceiveBufferSizePredictorFactory
+import org.jboss.netty.handler.timeout.WriteTimeoutHandler
+import org.jboss.netty.handler.timeout.ReadTimeoutHandler
+import org.jboss.netty.util.HashedWheelTimer
 
 /**
  * @author carlos.raphael.lopes@gmail.com
@@ -32,10 +36,11 @@ class UdpTrackerActor extends BaseActor with DataWriterClient {
   
   // messages to be tracked through this HashMap - note it is a mutable hashmap
   val sentMessages = mutable.HashMap.empty[String, (Long, UdpCheck, Session, ActorRef, String)]
-  val receivedMessages = mutable.HashMap.empty[String, (Long, UdpMessage)]
   
   override def postStop(): Unit = {
-    nioThreadPool.shutdown()
+    nioDatagramChannelFactory.releaseExternalResources()
+    nioThreadPool.shutdownNow()
+    sentMessages.clear()
   }
   
   override def receive: Receive = initialState
@@ -43,6 +48,10 @@ class UdpTrackerActor extends BaseActor with DataWriterClient {
   val initialState: Receive = {
     case Connect(tx) => {
       val connectionBootstrap = new ConnectionlessBootstrap(nioDatagramChannelFactory)
+      connectionBootstrap.setOption("sendBufferSize", 5242880)
+      connectionBootstrap.setOption("receiveBufferSize", 5242880)
+      connectionBootstrap.setOption("receiveBufferSizePredictorFactory", new FixedReceiveBufferSizePredictorFactory(1024))
+      
       connectionBootstrap.setPipelineFactory(new ChannelPipelineFactory {
           override def getPipeline: ChannelPipeline = {
             val pipeline = Channels.pipeline()
@@ -59,8 +68,10 @@ class UdpTrackerActor extends BaseActor with DataWriterClient {
       if (future.isSuccess) {
         val newSession = tx.session.set("udpTracker", self)
         val newTx = tx.copy(session = newSession)
-        context.become(connectedState(future.getChannel, connectionBootstrap, newTx))
-        tx.next ! newSession
+        val channel = future.getChannel
+        
+        context.become(connectedState(channel, connectionBootstrap, newTx))
+        newTx.next ! newSession
       } else {
         throw new RuntimeException
       }
@@ -69,17 +80,18 @@ class UdpTrackerActor extends BaseActor with DataWriterClient {
   
   def connectedState(channel: Channel, connectionBootstrap: ConnectionlessBootstrap, tx: UdpTx): Receive = {
     def failPendingCheck(udpCheck: UdpCheck, tx: UdpTx, message: String, sentTime: Long, receivedTime: Long): UdpTx = {
-      val newSession = tx.session.markAsFailed
-      val newTx = tx.copy(session = newSession)
-      
       udpCheck match {
         case c: UdpCheck =>
           logRequest(tx.session, tx.requestName, KO, sentTime, receivedTime, Some(message))
-          tx.next ! newSession
-          context.become(connectedState(channel, connectionBootstrap, newTx))
-          newTx
+          val newTx = tx.copy(updates = Session.MarkAsFailedUpdate :: tx.updates)
           
-        case _ => newTx
+          context.become(connectedState(channel, connectionBootstrap, newTx))
+
+          // release blocked session
+          newTx.next ! newTx.session
+          
+          newTx
+        case _ => tx
       }
     }
     
@@ -96,9 +108,9 @@ class UdpTrackerActor extends BaseActor with DataWriterClient {
           // apply updates and release blocked flow
           val newSession = tx.session.update(newUpdates)
 
-          tx.next ! newSession
           val newTx = tx.copy(session = newSession, updates = Nil)
           context.become(connectedState(channel, connectionBootstrap, newTx))
+          newTx.next ! newSession
         case _ =>
       }
     }
@@ -108,62 +120,59 @@ class UdpTrackerActor extends BaseActor with DataWriterClient {
       case MessageSend(requestName, check, message, session, next) =>
         val sendMessage = message.getOrElse(session("udpMessage").validate[UdpMessage].get)
         val start = nowMillis
-        
-        check match {
-          case c: UdpCheck =>
-            // do this immediately instead of self sending a Listen message so that other messages don't get a chance to be handled before
-            setCheck(tx, channel, requestName, c, next, session, connectionBootstrap, start)
-          case _ => next ! session
-        }
-        
+
         channel.write(sendMessage.content)
         
         tx.requestName = requestName
         val sentMessage = (start, check, session, next, requestName)
         sentMessages += session.userId -> sentMessage
+
+        val newSession = session.set("sentMessage", sentMessage)
+        val newTx = tx.copy(session = newSession, next = next)
+        context.become(connectedState(channel, connectionBootstrap, newTx))
+        
+        check match {
+          case c: UdpCheck =>
+            // do this immediately instead of self sending a Listen message so that other messages don't get a chance to be handled before
+            setCheck(newTx, channel, requestName, c, next, newSession, connectionBootstrap, start)
+          case _ => next ! session
+        }
+        
         
       // message was received; publish to the datawriter and remove from the hashmap
       case MessageReceived(requestId, received, message) =>
-        sentMessages.get(requestId) match {
-          case Some((startSend, check, session, next, requestName)) =>
-            logger.debug(s"Received text message on  :$message")
-            
-            implicit val cache = scala.collection.mutable.Map.empty[Any, Any]
-    
-            check.check(message, tx.session) match {
-              case io.gatling.core.validation.Success(result) =>
-                succeedPendingCheck(check, result, startSend, received)
-
-              case s => failPendingCheck(check, tx, s"check failed $s", startSend, received)
-            }
-            sentMessages -= requestId
-            
-            val receivedMessage = (received, message)
-            receivedMessages += requestId -> receivedMessage
-          
-          case None =>
-            val receivedMessage = (received, message)
-            receivedMessages += requestId -> receivedMessage
+        if (tx.session.userId.equals(requestId)) {
+        	Option(tx.session("sentMessage").validate[(Long, UdpCheck, Session, ActorRef, String)].get) match {
+        	case Some((startSend, check, session, next, requestName)) =>
+          	logger.debug(s"Received text message on  :$message")
+          	
+          	implicit val cache = scala.collection.mutable.Map.empty[Any, Any]
+          			
+      			check.check(message, tx.session) match {
+        			case io.gatling.core.validation.Success(result) =>
+        			succeedPendingCheck(check, result, startSend, received)
+        			
+        			case s => failPendingCheck(check, tx, s"check failed $s", startSend, received)
+          	}
+        	  sentMessages -= requestId
+        			
+        	case None =>
+        	}
         }
       
       case CheckTimeout(check, sentTime) =>
         check match {
           case timeout: UdpCheck =>
-            val newTx = failPendingCheck(check, tx, "Check failed: Timeout", sentTime, nowMillis)
-            context.become(connectedState(channel, connectionBootstrap, newTx))
-
-            // release blocked session
-            newTx.next ! newTx.applyUpdates(newTx.session).session
+            failPendingCheck(check, tx, "Gatling check failed: Timeout", sentTime, nowMillis)
           case _ =>
         }
         
       case Disconnect(requestName, next, session) => {
         logger.debug(s"Disconnect channel for session: $session")
-        channel.close()
+        channel.close().awaitUninterruptibly()
         connectionBootstrap.releaseExternalResources()
-        val newSession: Session = session.remove("channel")
 
-        next ! newSession
+        next ! session
       }
     }
   }
@@ -187,7 +196,12 @@ class UdpTrackerActor extends BaseActor with DataWriterClient {
 
     // schedule timeout
     scheduler.scheduleOnce(check.timeout) {
-      self ! CheckTimeout(check, sentTime)
+      sentMessages.get(session.userId) match {
+        case Some((startSend, check, session, next, requestName)) =>
+          sentMessages -= session.userId
+          self ! CheckTimeout(check, sentTime)
+        case None =>
+      }
     }
 
     val newTx = tx

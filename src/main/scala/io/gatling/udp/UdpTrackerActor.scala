@@ -22,6 +22,7 @@ import org.jboss.netty.channel.ChannelPipeline
 import org.jboss.netty.channel.Channels
 import java.net.InetSocketAddress
 import org.jboss.netty.channel.FixedReceiveBufferSizePredictorFactory
+import org.jboss.netty.channel.AdaptiveReceiveBufferSizePredictorFactory
 import org.jboss.netty.handler.timeout.WriteTimeoutHandler
 import org.jboss.netty.handler.timeout.ReadTimeoutHandler
 import org.jboss.netty.util.HashedWheelTimer
@@ -50,7 +51,7 @@ class UdpTrackerActor extends BaseActor with DataWriterClient {
       val connectionBootstrap = new ConnectionlessBootstrap(nioDatagramChannelFactory)
       connectionBootstrap.setOption("sendBufferSize", 5242880)
       connectionBootstrap.setOption("receiveBufferSize", 5242880)
-      connectionBootstrap.setOption("receiveBufferSizePredictorFactory", new FixedReceiveBufferSizePredictorFactory(1024))
+      connectionBootstrap.setOption("receiveBufferSizePredictorFactory", new AdaptiveReceiveBufferSizePredictorFactory(1024, 1024, 2048))
       
       connectionBootstrap.setPipelineFactory(new ChannelPipelineFactory {
           override def getPipeline: ChannelPipeline = {

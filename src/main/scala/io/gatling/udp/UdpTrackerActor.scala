@@ -32,7 +32,7 @@ import org.jboss.netty.util.HashedWheelTimer
 class UdpTrackerActor extends BaseActor with DataWriterClient {
   
   val nioThreadPool = Executors.newCachedThreadPool
-  val nioDatagramChannelFactory = new NioDatagramChannelFactory(nioThreadPool, Runtime.getRuntime.availableProcessors())
+  val nioDatagramChannelFactory = new NioDatagramChannelFactory(nioThreadPool, Integer.parseInt(System.getProperty("gatling.udp.netty.threads", "2")))
   
   // messages to be tracked through this HashMap - note it is a mutable hashmap
   val sentMessages = mutable.HashMap.empty[String, (Long, UdpCheck, Session, ActorRef, String)]
